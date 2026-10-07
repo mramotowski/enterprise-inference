@@ -132,6 +132,8 @@ ${BOLD}${CYAN}For status / scale / logs, use kubectl:${RESET}
 
 ${BOLD}${CYAN}Environment:${RESET}
   ${GREEN}HF_TOKEN${RESET}              HuggingFace token for gated models
+  ${GREEN}MM_HF_TOKEN_FROM_SECRET${RESET}
+                        true ⇒ with HF_TOKEN unset, use the existing hf-token Secret
   ${GREEN}MM_CONFIG${RESET}             Path to models.yaml
   ${GREEN}MM_CPU_POLICY${RESET}         Cluster CPU policy: nri-balloons (default) |
                         kubelet-static | best-effort. Set by the Ansible
@@ -360,6 +362,28 @@ model_uses_trust_remote_code() {
     return 1
 }
 
+# ── HF token from an existing Secret (opt-in) ────────────────────────────────
+# With MM_HF_TOKEN_FROM_SECRET=true|1|yes and HF_TOKEN unset, pods reference the
+# hf-token Secret (key `token`) already present in the model namespace (e.g.
+# projected by External Secrets) instead of one created from the host's
+# HF_TOKEN. The token never passes through this shell. HF_TOKEN set always wins.
+hf_token_from_secret() {
+    [[ -z "${HF_TOKEN:-}" && "${MM_HF_TOKEN_FROM_SECRET:-}" =~ ^(true|1|yes)$ ]]
+}
+
+# Presence-only check: true when the Secret in namespace $1 has a non-empty
+# `token` key. The go-template prints a fixed marker, never the value.
+hf_token_secret_present() {
+    # stderr is folded in for the error message; stdout only ever carries the marker.
+    local marker
+    if ! marker=$(kubectl get secret hf-token -n "$1" \
+        -o go-template='{{with .data}}{{with index . "token"}}present{{end}}{{end}}' 2>&1); then
+        [[ "$marker" == *NotFound* ]] || warn "Cannot read Secret hf-token in namespace $1: $marker"
+        return 1
+    fi
+    [[ "$marker" == "present" ]]
+}
+
 # Env block. Precedence (lowest → highest), all deduped into one map so a
 # higher layer replaces rather than appends a duplicate env name:
 #   trust-remote-code default → runtime shared .env → category env →
@@ -424,12 +448,23 @@ build_env_block() {
         _append_env no_proxy    "${MM_NO_PROXY:-}"
         unset -f _append_env
 
-        [[ -n "${HF_TOKEN:-}" ]] && out+="        - name: HF_TOKEN
+        if [[ -n "${HF_TOKEN:-}" ]]; then
+            out+="        - name: HF_TOKEN
           valueFrom:
             secretKeyRef:
               name: hf-token
               key: token
 "
+        elif hf_token_from_secret; then
+            # optional: a Secret not yet projected never blocks pod start.
+            out+="        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: token
+              optional: true
+"
+        fi
     fi
 
     # CLI --env is already folded into the merged map above. Emit a leading
@@ -786,8 +821,14 @@ render_manifest() {
 download_weights() {
     check_network
 
-    # Refuse to download a gated model without an HF_TOKEN.
-    if [[ -z "${HF_TOKEN:-}" ]]; then
+    # Refuse to download a gated model without an HF_TOKEN. In the opt-in
+    # Secret path a present hf-token Secret stands in for HF_TOKEN: the HF API
+    # check is skipped and an unauthorized token surfaces as a Job auth failure.
+    local token_from_secret=false
+    hf_token_from_secret && token_from_secret=true
+    if [[ "$token_from_secret" == true ]] && hf_token_secret_present "$MODEL_NAMESPACE"; then
+        info "Using HF token from Secret hf-token (key token) in namespace $MODEL_NAMESPACE"
+    elif [[ -z "${HF_TOKEN:-}" ]]; then
         local proxy_args=()
         [[ -n "${MM_HTTPS_PROXY:-}" ]] && proxy_args=(--proxy "$MM_HTTPS_PROXY")
         local gated
@@ -795,6 +836,7 @@ download_weights() {
             "https://huggingface.co/api/models/$MODEL_ID" 2>/dev/null \
             | jq -r '.gated // empty' 2>/dev/null) || true
         if [[ -n "$gated" && "$gated" != "false" ]]; then
+            [[ "$token_from_secret" == true ]] && abort "Model '$MODEL_ID' is gated and Secret hf-token (key token) is missing or empty in namespace $MODEL_NAMESPACE. Provide the Secret or set HF_TOKEN."
             abort "Model '$MODEL_ID' is gated. Set HF_TOKEN with an authorized token."
         fi
     fi
@@ -802,6 +844,8 @@ download_weights() {
     info "Downloading model weights: $MODEL_ID → PVC:/$MODEL_NAME"
 
     if [[ -n "${HF_TOKEN:-}" ]]; then
+        [[ "${MM_HF_TOKEN_FROM_SECRET:-}" =~ ^(true|1|yes)$ ]] && \
+            warn "HF_TOKEN takes precedence over MM_HF_TOKEN_FROM_SECRET and overwrites Secret hf-token in namespace $MODEL_NAMESPACE"
         kubectl create secret generic hf-token -n "$MODEL_NAMESPACE" \
             --from-literal=token="$HF_TOKEN" --dry-run=client -o yaml \
             | kubectl apply -f - >/dev/null 2>&1
@@ -823,6 +867,15 @@ download_weights() {
                 secretKeyRef:
                   name: hf-token
                   key: token"
+    # Opt-in: reference the existing Secret; optional so a missing one never
+    # blocks the Job (the gated check above already aborted if it was needed).
+    [[ "$token_from_secret" == true ]] && env_entries+="
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+                  optional: true"
     _append_proxy() {
         [[ -z "$2" ]] && return 0
         env_entries+="
@@ -952,6 +1005,7 @@ touch $sentinel"
         local logs
         logs=$(kubectl logs -l "job-name=download-$MODEL_NAME" -n "$MODEL_NAMESPACE" --tail=20 2>/dev/null) || logs=""
         if echo "$logs" | grep -qi "401\|access denied\|gated\|authorization"; then
+            [[ "$token_from_secret" == true ]] && abort "Download failed: model '$MODEL_ID' requires authentication. Check that Secret hf-token (key token) in namespace $MODEL_NAMESPACE holds an authorized token."
             abort "Download failed: model '$MODEL_ID' requires authentication. Set HF_TOKEN with an authorized token."
         elif echo "$logs" | grep -qi "ConnectError\|ConnectionError\|timeout"; then
             abort "Download failed: network error reaching HuggingFace. Check proxy settings."

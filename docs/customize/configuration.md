@@ -222,6 +222,7 @@ Disabling NFD means those affinity rules cannot be satisfied.
 | Variable | Purpose |
 |----------|---------|
 | `HF_TOKEN` | Hugging Face token for gated models |
+| `MM_HF_TOKEN_FROM_SECRET` | `true` — with `HF_TOKEN` unset, use the existing `hf-token` Secret (key `token`) in the model namespace instead (see [Gated models](../deploy/deploy_models.md#gated-models-hugging-face-token)) |
 | `MM_CONFIG` | Path to the model catalog (`models.yaml`) |
 | `MM_GLOBAL_CONFIG` | Path to the platform's `global_config.yaml` |
 | `MM_INFERENCE_HOSTNAME` | Override the resolved endpoint hostname in either auth mode |

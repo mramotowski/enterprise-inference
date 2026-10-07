@@ -101,6 +101,16 @@ The download Job receives the token automatically. Public models work without it
 gated model **without** a token fails fast with a clear "model is gated — set
 HF_TOKEN" message, and during auto-deploy is reported without aborting the install.
 
+**Token from an existing Secret.** When a solution already provides the token as Secret
+`hf-token` (key `token`) in the model namespace (Intel® AI for Enterprise RAG does that
+with its OpenBao backend), set `MM_HF_TOKEN_FROM_SECRET=true` and leave `HF_TOKEN` unset.
+The model pods then reference that Secret, and the token never passes through the host
+running `model-manager`. The reference is optional, so a Secret that is not there yet
+does not block the pod start. A gated model without that Secret fails fast, naming the
+missing Secret. With the Secret present, the gated pre-check is skipped, so a token
+without access to the model shows up as an authorization failure of the download Job.
+`HF_TOKEN`, when set, still takes precedence and overwrites the Secret.
+
 ## Models with custom code (`--trust-remote-code`)
 
 Some Hugging Face models ship custom modeling code that vLLM only loads with
